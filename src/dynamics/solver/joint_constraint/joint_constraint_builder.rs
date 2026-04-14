@@ -69,15 +69,19 @@ impl JointConstraintBuilder {
         let world_com1 = Point::from(rb1.pose.translation.vector);
         let world_com2 = Point::from(rb2.pose.translation.vector);
 
+        // Halo-2-style mass-ratio clamping: cap the heavier body's effective
+        // mass to 16x the lighter for this joint only. See mass_clamp.rs.
+        let (mass_scale1, mass_scale2) =
+            crate::dynamics::solver::mass_clamp::mass_clamp_scales_scalar(rb1.im, rb2.im, true);
         let joint_body1 = JointSolverBody {
-            im: rb1.im,
-            ii: rb1.ii,
+            im: rb1.im * mass_scale1,
+            ii: crate::dynamics::solver::mass_clamp::scale_inertia(rb1.ii, mass_scale1),
             world_com: world_com1,
             solver_vel: [self.body1],
         };
         let joint_body2 = JointSolverBody {
-            im: rb2.im,
-            ii: rb2.ii,
+            im: rb2.im * mass_scale2,
+            ii: crate::dynamics::solver::mass_clamp::scale_inertia(rb2.ii, mass_scale2),
             world_com: world_com2,
             solver_vel: [self.body2],
         };
@@ -170,15 +174,18 @@ impl JointConstraintBuilderSimd {
         let frame1 = rb1.pose * self.local_frame1;
         let frame2 = rb2.pose * self.local_frame2;
 
+        // Halo-2-style mass-ratio clamping (see mass_clamp.rs).
+        let (mass_scale1, mass_scale2) =
+            crate::dynamics::solver::mass_clamp::mass_clamp_scales_simd(rb1.im, rb2.im);
         let joint_body1 = JointSolverBody {
-            im: rb1.im,
-            ii: rb1.ii,
+            im: rb1.im * mass_scale1,
+            ii: crate::dynamics::solver::mass_clamp::scale_inertia(rb1.ii, mass_scale1),
             world_com: rb1.pose.translation.vector.into(),
             solver_vel: self.body1,
         };
         let joint_body2 = JointSolverBody {
-            im: rb2.im,
-            ii: rb2.ii,
+            im: rb2.im * mass_scale2,
+            ii: crate::dynamics::solver::mass_clamp::scale_inertia(rb2.ii, mass_scale2),
             world_com: rb2.pose.translation.vector.into(),
             solver_vel: self.body2,
         };

@@ -16,6 +16,7 @@ use solver_body::SolverVel;
 
 mod categorization;
 mod contact_constraint;
+mod mass_clamp;
 mod interaction_groups;
 // #[cfg(not(feature = "parallel"))]
 mod island_solver;
