@@ -70,14 +70,6 @@ impl ContactWithCoulombFrictionBuilder {
         let vels2 = solver_bodies.gather_vels(ids2);
         let poses2 = solver_bodies.gather_poses(ids2);
 
-        // Halo-2-style mass-ratio clamping: cap the heavier body's effective
-        // mass to MASS_RATIO_CAP * lighter for this contact only. Applied
-        // uniformly to inverse mass and inverse inertia.
-        let (mass_scale1, mass_scale2) =
-            crate::dynamics::solver::mass_clamp::mass_clamp_scales_simd(poses1.im, poses2.im);
-        let im1 = poses1.im * mass_scale1;
-        let im2 = poses2.im * mass_scale2;
-
         let world_com1 = Point::from(poses1.pose.translation.vector);
         let world_com2 = Point::from(poses2.pose.translation.vector);
 
@@ -100,8 +92,8 @@ impl ContactWithCoulombFrictionBuilder {
             let builder = &mut out_builders[l / MAX_MANIFOLD_POINTS];
 
             constraint.dir1 = force_dir1;
-            constraint.im1 = im1;
-            constraint.im2 = im2;
+            constraint.im1 = poses1.im;
+            constraint.im2 = poses2.im;
             constraint.solver_vel1 = ids1;
             constraint.solver_vel2 = ids2;
             constraint.manifold_id = manifold_id;
@@ -133,10 +125,10 @@ impl ContactWithCoulombFrictionBuilder {
                 {
                     let torque_dir1 = dp1.gcross(force_dir1);
                     let torque_dir2 = dp2.gcross(-force_dir1);
-                    let ii_torque_dir1 = poses1.ii.transform_vector(torque_dir1) * mass_scale1;
-                    let ii_torque_dir2 = poses2.ii.transform_vector(torque_dir2) * mass_scale2;
+                    let ii_torque_dir1 = poses1.ii.transform_vector(torque_dir1);
+                    let ii_torque_dir2 = poses2.ii.transform_vector(torque_dir2);
 
-                    let imsum = im1 + im2;
+                    let imsum = poses1.im + poses2.im;
                     let projected_mass = utils::simd_inv(
                         force_dir1.dot(&imsum.component_mul(&force_dir1))
                             + ii_torque_dir1.gdot(torque_dir1)
@@ -161,10 +153,10 @@ impl ContactWithCoulombFrictionBuilder {
                 for j in 0..DIM - 1 {
                     let torque_dir1 = dp1.gcross(tangents1[j]);
                     let torque_dir2 = dp2.gcross(-tangents1[j]);
-                    let ii_torque_dir1 = poses1.ii.transform_vector(torque_dir1) * mass_scale1;
-                    let ii_torque_dir2 = poses2.ii.transform_vector(torque_dir2) * mass_scale2;
+                    let ii_torque_dir1 = poses1.ii.transform_vector(torque_dir1);
+                    let ii_torque_dir2 = poses2.ii.transform_vector(torque_dir2);
 
-                    let imsum = im1 + im2;
+                    let imsum = poses1.im + poses2.im;
 
                     let r = tangents1[j].dot(&imsum.component_mul(&tangents1[j]))
                         + ii_torque_dir1.gdot(torque_dir1)
@@ -211,7 +203,7 @@ impl ContactWithCoulombFrictionBuilder {
                     let k0 = k * 2;
                     let k1 = k * 2 + 1;
 
-                    let imsum = im1 + im2;
+                    let imsum = poses1.im + poses2.im;
                     let r0 = constraint.normal_part[k0].r;
                     let r1 = constraint.normal_part[k1].r;
 

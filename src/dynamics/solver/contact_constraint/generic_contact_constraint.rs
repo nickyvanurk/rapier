@@ -110,25 +110,13 @@ impl GenericContactConstraintBuilder {
             let builder = &mut out_builders[l];
             let constraint = &mut out_constraints[l];
             constraint.dir1 = force_dir1;
-            // Halo-2-style mass-ratio clamping (see mass_clamp.rs). Skipped
-            // when either body is a multibody (mass encoded in jacobians) or
-            // static/kinematic.
-            let dynamic_pair = multibody1.is_none()
-                && multibody2.is_none()
-                && type1.is_dynamic_or_kinematic()
-                && type2.is_dynamic_or_kinematic();
-            let (mass_scale1, mass_scale2) = crate::dynamics::solver::mass_clamp::mass_clamp_scales_scalar(
-                mprops1.effective_inv_mass,
-                mprops2.effective_inv_mass,
-                dynamic_pair,
-            );
             constraint.im1 = if type1.is_dynamic_or_kinematic() {
-                mprops1.effective_inv_mass * mass_scale1
+                mprops1.effective_inv_mass
             } else {
                 na::zero()
             };
             constraint.im2 = if type2.is_dynamic_or_kinematic() {
-                mprops2.effective_inv_mass * mass_scale2
+                mprops2.effective_inv_mass
             } else {
                 na::zero()
             };
@@ -163,7 +151,6 @@ impl GenericContactConstraintBuilder {
                         mprops1
                             .effective_world_inv_inertia
                             .transform_vector(torque_dir1)
-                            * mass_scale1
                     } else {
                         na::zero()
                     };
@@ -171,7 +158,6 @@ impl GenericContactConstraintBuilder {
                         mprops2
                             .effective_world_inv_inertia
                             .transform_vector(torque_dir2)
-                            * mass_scale2
                     } else {
                         na::zero()
                     };
@@ -189,8 +175,7 @@ impl GenericContactConstraintBuilder {
                         )
                         .0
                     } else if type1.is_dynamic_or_kinematic() {
-                        mass_scale1
-                            * force_dir1.dot(&mprops1.effective_inv_mass.component_mul(&force_dir1))
+                        force_dir1.dot(&mprops1.effective_inv_mass.component_mul(&force_dir1))
                             + ii_torque_dir1.gdot(torque_dir1)
                     } else {
                         0.0
@@ -209,8 +194,7 @@ impl GenericContactConstraintBuilder {
                         )
                         .0
                     } else if type2.is_dynamic_or_kinematic() {
-                        mass_scale2
-                            * force_dir1.dot(&mprops2.effective_inv_mass.component_mul(&force_dir1))
+                        force_dir1.dot(&mprops2.effective_inv_mass.component_mul(&force_dir1))
                             + ii_torque_dir2.gdot(torque_dir2)
                     } else {
                         0.0
@@ -247,7 +231,6 @@ impl GenericContactConstraintBuilder {
                             mprops1
                                 .effective_world_inv_inertia
                                 .transform_vector(torque_dir1)
-                                * mass_scale1
                         } else {
                             na::zero()
                         };
@@ -259,7 +242,6 @@ impl GenericContactConstraintBuilder {
                             mprops2
                                 .effective_world_inv_inertia
                                 .transform_vector(torque_dir2)
-                                * mass_scale2
                         } else {
                             na::zero()
                         };
@@ -279,9 +261,7 @@ impl GenericContactConstraintBuilder {
                             )
                             .0
                         } else if type1.is_dynamic_or_kinematic() {
-                            mass_scale1
-                                * force_dir1
-                                    .dot(&mprops1.effective_inv_mass.component_mul(&force_dir1))
+                            force_dir1.dot(&mprops1.effective_inv_mass.component_mul(&force_dir1))
                                 + ii_torque_dir1.gdot(torque_dir1)
                         } else {
                             0.0
@@ -300,9 +280,7 @@ impl GenericContactConstraintBuilder {
                             )
                             .0
                         } else if type2.is_dynamic_or_kinematic() {
-                            mass_scale2
-                                * force_dir1
-                                    .dot(&mprops2.effective_inv_mass.component_mul(&force_dir1))
+                            force_dir1.dot(&mprops2.effective_inv_mass.component_mul(&force_dir1))
                                 + ii_torque_dir2.gdot(torque_dir2)
                         } else {
                             0.0
