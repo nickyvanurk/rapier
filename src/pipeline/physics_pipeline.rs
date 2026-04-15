@@ -357,6 +357,7 @@ impl PhysicsPipeline {
         broad_phase: &mut BroadPhaseBvh,
         narrow_phase: &NarrowPhase,
         ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
         self.counters.ccd.toi_computation_time.start();
@@ -368,6 +369,7 @@ impl PhysicsPipeline {
             colliders,
             broad_phase,
             narrow_phase,
+            hooks,
             events,
         );
         ccd_solver.clamp_motions(integration_parameters.dt, bodies, &impacts);
@@ -600,6 +602,7 @@ impl PhysicsPipeline {
                         colliders,
                         broad_phase,
                         narrow_phase,
+                        hooks,
                     )
                 } else {
                     None
@@ -669,6 +672,7 @@ impl PhysicsPipeline {
                         broad_phase,
                         narrow_phase,
                         ccd_solver,
+                        hooks,
                         events,
                     );
                 }
