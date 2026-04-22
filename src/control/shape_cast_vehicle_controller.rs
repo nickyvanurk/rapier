@@ -345,7 +345,13 @@ impl DynamicShapeCastVehicleController {
     }
 
     #[profiling::function]
-    fn shape_cast(&mut self, queries: &QueryPipeline, chassis: &RigidBody, wheel_id: usize) {
+    fn shape_cast(
+        &mut self,
+        queries: &QueryPipeline,
+        chassis: &RigidBody,
+        wheel_id: usize,
+        dt: Real,
+    ) {
         let wheel = &mut self.wheels[wheel_id];
         let source = wheel.shape_cast_info.hard_point_ws;
 
@@ -433,9 +439,24 @@ impl DynamicShapeCastVehicleController {
             // compression distance has to be absorbed rigidly, not by
             // spring force.
             let max_suspension_length = wheel.suspension_rest_length + wheel.max_suspension_travel;
+            let target_length = raw_length.clamp(0.0, max_suspension_length);
             wheel.shape_cast_info.bottomed_out = raw_length < 0.0;
             wheel.shape_cast_info.bottom_out_overshoot = (-raw_length).max(0.0);
-            wheel.shape_cast_info.suspension_length = raw_length.clamp(0.0, max_suspension_length);
+
+            // Smooth the extending direction only (wheel stretching down to
+            // meet ground that just came into view). Compression stays
+            // instant — the chassis needs to feel bumps on the same frame,
+            // and a fast-falling chassis must not visibly sink through the
+            // ground while the spring ramps up.
+            let prev_length = wheel.shape_cast_info.suspension_length;
+            if target_length > prev_length {
+                let time_constant = 0.05;
+                let factor = 1.0 - (-dt / time_constant).exp();
+                wheel.shape_cast_info.suspension_length =
+                    prev_length + (target_length - prev_length) * factor;
+            } else {
+                wheel.shape_cast_info.suspension_length = target_length;
+            }
             wheel.shape_cast_info.contact_point_ws = hit.witness1;
 
             let denominator = wheel
@@ -458,8 +479,17 @@ impl DynamicShapeCastVehicleController {
                 wheel.clipped_inv_contact_dot_suspension = inv;
             }
         } else {
-            // No contact, put wheel info as in rest position
-            wheel.shape_cast_info.suspension_length = wheel.suspension_rest_length;
+            // No contact. Droop toward the full extension stop
+            // (`rest + max_travel`), not rest: a real suspension hangs at
+            // its droop limit under gravity, and pre-extending the wheel
+            // while airborne means there's little to catch up on when the
+            // ground reappears — reduces the landing-side snap that
+            // Bullet's btRaycastVehicle is known for. ~200 ms TC.
+            let droop_length = wheel.suspension_rest_length + wheel.max_suspension_travel;
+            let time_constant = 0.2;
+            let factor = 1.0 - (-dt / time_constant).exp();
+            wheel.shape_cast_info.suspension_length +=
+                (droop_length - wheel.shape_cast_info.suspension_length) * factor;
             wheel.shape_cast_info.bottomed_out = false;
             wheel.shape_cast_info.bottom_out_overshoot = 0.0;
             wheel.suspension_relative_velocity = 0.0;
@@ -491,7 +521,7 @@ impl DynamicShapeCastVehicleController {
         //
 
         for wheel_id in 0..self.wheels.len() {
-            self.shape_cast(&queries.as_ref(), chassis, wheel_id);
+            self.shape_cast(&queries.as_ref(), chassis, wheel_id, dt);
         }
 
         let chassis_mass = chassis.mass();
