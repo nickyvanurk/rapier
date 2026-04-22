@@ -250,6 +250,16 @@ pub struct ShapeCastInfo {
     pub is_in_contact: bool,
     /// The collider hit by the shape-cast.
     pub ground_object: Option<ColliderHandle>,
+    /// Debug: raw TOI returned by the last shape-cast hit.
+    pub last_toi: Real,
+    /// Debug: starting-position offset (along `-direction`) used for the last shape-cast.
+    pub last_cast_offset: Real,
+    /// Debug: witness point on the cylinder side (local to cylinder, world space).
+    pub last_witness2: Point<Real>,
+    /// Debug: cylinder starting center (world space).
+    pub last_cast_start: Point<Real>,
+    /// Debug: world-space axle used for the last shape-cast.
+    pub last_axle_ws: Vector<Real>,
 }
 
 impl DynamicShapeCastVehicleController {
@@ -328,7 +338,6 @@ impl DynamicShapeCastVehicleController {
     #[profiling::function]
     fn shape_cast(&mut self, queries: &QueryPipeline, chassis: &RigidBody, wheel_id: usize) {
         let wheel = &mut self.wheels[wheel_id];
-        let max_sweep = wheel.suspension_rest_length + wheel.max_suspension_travel;
         let source = wheel.shape_cast_info.hard_point_ws;
 
         // Parry’s `Cylinder` has its axis along +Y. Align that axis with the wheel axle.
@@ -338,24 +347,54 @@ impl DynamicShapeCastVehicleController {
             .unwrap_or_else(|| Vector::y());
         let cyl_rot = Rotation::rotation_between(&Vector::y(), &axle)
             .unwrap_or_else(Rotation::identity);
-        let cyl_pose = Isometry::from_parts(Translation::from(source.coords), cyl_rot);
         let cylinder = Cylinder::new(wheel.width * 0.5, wheel.radius);
 
-        // Sweep along the suspension direction. Use a unit velocity so
-        // `time_of_impact` is the distance travelled (== suspension length).
         let direction = wheel
             .wheel_direction_ws
             .try_normalize(1.0e-5)
             .unwrap_or(wheel.wheel_direction_ws);
 
-        let options = ShapeCastOptions {
-            max_time_of_impact: max_sweep,
-            target_distance: 0.0,
-            stop_at_penetration: true,
-            compute_impact_geometry_on_penetration: true,
-        };
+        // Start the cylinder one radius behind the hard_point (opposite to
+        // cast direction) so its near cap sits at the hard_point — prevents
+        // starting inside the ground. If toi=0 (cylinder still clips terrain
+        // at that offset), retry at 2× radius.
+        // suspension_length = toi − offset, matching the raycast’s
+        // hit_distance − radius formula.
+        let r = wheel.radius;
+        let raylen = wheel.suspension_rest_length + r;
 
-        let hit = queries.cast_shape(&cyl_pose, &direction, &cylinder, options);
+        let (hit, offset) = {
+            let offset = r;
+            let pos = Isometry::from_parts(
+                Translation::from(source.coords - direction * offset),
+                cyl_rot,
+            );
+            let options = ShapeCastOptions {
+                max_time_of_impact: raylen + offset,
+                target_distance: 0.0,
+                stop_at_penetration: true,
+                compute_impact_geometry_on_penetration: true,
+            };
+            let result = queries.cast_shape(&pos, &direction, &cylinder, options);
+
+            // toi=0 means the cylinder started in penetration — retry with double offset
+            if result.as_ref().is_some_and(|(_, h)| h.time_of_impact == 0.0) {
+                let offset = r * 2.0;
+                let pos = Isometry::from_parts(
+                    Translation::from(source.coords - direction * offset),
+                    cyl_rot,
+                );
+                let options = ShapeCastOptions {
+                    max_time_of_impact: raylen + offset,
+                    target_distance: 0.0,
+                    stop_at_penetration: true,
+                    compute_impact_geometry_on_penetration: true,
+                };
+                (queries.cast_shape(&pos, &direction, &cylinder, options), offset)
+            } else {
+                (result, offset)
+            }
+        };
 
         wheel.shape_cast_info.ground_object = None;
 
@@ -369,9 +408,12 @@ impl DynamicShapeCastVehicleController {
             wheel.shape_cast_info.is_in_contact = true;
             wheel.shape_cast_info.ground_object = Some(collider_hit);
 
-            // Unit-velocity cast: `time_of_impact` is the distance travelled by the cylinder
-            // centre from `hard_point_ws`, which is exactly the suspension length.
-            wheel.shape_cast_info.suspension_length = hit.time_of_impact;
+            wheel.shape_cast_info.suspension_length = hit.time_of_impact - offset;
+            wheel.shape_cast_info.last_toi = hit.time_of_impact;
+            wheel.shape_cast_info.last_cast_offset = offset;
+            wheel.shape_cast_info.last_witness2 = hit.witness2;
+            wheel.shape_cast_info.last_cast_start = Point::from(source.coords - direction * offset);
+            wheel.shape_cast_info.last_axle_ws = axle;
 
             // clamp on max suspension travel
             let min_suspension_length = wheel.suspension_rest_length - wheel.max_suspension_travel;
