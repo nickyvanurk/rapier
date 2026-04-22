@@ -399,10 +399,12 @@ impl DynamicShapeCastVehicleController {
         wheel.shape_cast_info.ground_object = None;
 
         if let Some((collider_hit, hit)) = hit {
-            let mut normal = *hit.normal1;
-            if normal == Vector::zeros() {
-                normal = -wheel.wheel_direction_ws;
-            }
+            // Lock the contact normal to the suspension axis. Using
+            // `hit.normal1` lets a wheel clipping a vertical face (wall,
+            // curb, side of a log) apply the suspension force sideways and
+            // launch the chassis. Trading a bit of slope-accuracy for a
+            // cleanly-axial spring.
+            let normal = -wheel.wheel_direction_ws;
 
             wheel.shape_cast_info.contact_normal_ws = normal;
             wheel.shape_cast_info.is_in_contact = true;
