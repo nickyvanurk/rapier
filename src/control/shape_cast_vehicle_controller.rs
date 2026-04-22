@@ -6,6 +6,7 @@ use crate::math::{Isometry, Point, Real, Rotation, Translation, Vector};
 use crate::pipeline::QueryPipeline;
 use crate::prelude::QueryPipelineMut;
 use crate::utils::{SimdCross, SimdDot};
+use na::{DMatrix, DVector};
 use parry::query::details::ShapeCastOptions;
 
 /// A character controller to simulate vehicles using cylinder shape-casting for the wheels.
@@ -369,17 +370,20 @@ impl DynamicShapeCastVehicleController {
             .try_normalize(1.0e-5)
             .unwrap_or(wheel.wheel_direction_ws);
 
-        // Start the cylinder one radius behind the hard_point (opposite to
-        // cast direction) so its near cap sits at the hard_point — prevents
-        // starting inside the ground. If toi=0 (cylinder still clips terrain
-        // at that offset), retry at 2× radius.
-        // suspension_length = toi − offset, matching the raycast’s
+        // Start the cylinder 4× radius behind the hard_point (opposite to
+        // cast direction) so there is plenty of margin before any chassis
+        // geometry above the wheel — the extra headroom avoids the
+        // "cylinder begins in penetration" edge cases that used to need a
+        // retry-with-larger-offset fallback. Detection range stays the
+        // same because `max_time_of_impact = raylen + offset` grows with
+        // `offset`.
+        // suspension_length = toi − offset, matching the raycast's
         // hit_distance − radius formula.
         let r = wheel.radius;
         let raylen = wheel.suspension_rest_length + r;
+        let offset = 4.0 * r;
 
-        let (hit, offset) = {
-            let offset = r;
+        let hit = {
             let pos = Isometry::from_parts(
                 Translation::from(source.coords - direction * offset),
                 cyl_rot,
@@ -390,25 +394,7 @@ impl DynamicShapeCastVehicleController {
                 stop_at_penetration: true,
                 compute_impact_geometry_on_penetration: true,
             };
-            let result = queries.cast_shape(&pos, &direction, &cylinder, options);
-
-            // toi=0 means the cylinder started in penetration — retry with double offset
-            if result.as_ref().is_some_and(|(_, h)| h.time_of_impact == 0.0) {
-                let offset = r * 2.0;
-                let pos = Isometry::from_parts(
-                    Translation::from(source.coords - direction * offset),
-                    cyl_rot,
-                );
-                let options = ShapeCastOptions {
-                    max_time_of_impact: raylen + offset,
-                    target_distance: 0.0,
-                    stop_at_penetration: true,
-                    compute_impact_geometry_on_penetration: true,
-                };
-                (queries.cast_shape(&pos, &direction, &cylinder, options), offset)
-            } else {
-                (result, offset)
-            }
+            queries.cast_shape(&pos, &direction, &cylinder, options)
         };
 
         wheel.shape_cast_info.ground_object = None;
@@ -546,38 +532,158 @@ impl DynamicShapeCastVehicleController {
 
             let impulse = wheel.shape_cast_info.contact_normal_ws * suspension_force * dt;
             chassis.apply_impulse_at_point(impulse, wheel.shape_cast_info.contact_point_ws, false);
+        }
 
-            // Bump stop. When the suspension is fully compressed the spring
-            // is physically at its end of travel; further compression can't
-            // be absorbed by force alone. Cancel the chassis velocity into
-            // the ground at the contact (plastic collision) and shift the
-            // chassis back by the overshoot so the wheel visibly sits at
-            // the hard point instead of below it.
-            if wheel.shape_cast_info.bottomed_out {
-                let normal = wheel.shape_cast_info.contact_normal_ws;
-                let contact = wheel.shape_cast_info.contact_point_ws;
-                let vel = chassis.velocity_at_point(&contact);
-                let rel_vel = normal.dot(&vel);
-                if rel_vel < 0.0 {
-                    let dpt = contact - chassis.center_of_mass();
-                    let aj = dpt.gcross(normal);
-                    let iaj = chassis.mprops.effective_world_inv_inertia * aj;
-                    let jac = chassis.mprops.local_mprops.inv_mass + iaj.gdot(iaj);
-                    let inv_jac = crate::utils::inv(jac);
-                    let impulse_mag = -rel_vel * inv_jac;
-                    chassis.apply_impulse_at_point(normal * impulse_mag, contact, false);
-                }
-
-                // Position correction: translate the chassis up by the
-                // overshoot so we don't accumulate penetration. Use a
-                // Baumgarte-style 0.8 factor to keep it stable.
-                let correction = normal * (wheel.shape_cast_info.bottom_out_overshoot * 0.8);
-                let new_pos = Isometry::from_parts(
-                    Translation::from(chassis.position().translation.vector + correction),
-                    chassis.position().rotation,
-                );
-                chassis.set_position(new_pos, true);
+        // Bump-stop velocity constraint — direct solve across all bottomed
+        // wheels (Havok's recommended pattern for vehicle suspensions:
+        // single-pass simultaneous solve beats iterative PGS when multiple
+        // unilateral contacts share a body).
+        //
+        // For each bottomed wheel i with contact `p_i` and normal `n_i`,
+        // we enforce `v_at(p_i) · n_i ≥ 0`. Write the velocity change
+        // produced by impulses λ along each normal as:
+        //     Δv_at(p_i) · n_i = Σ_j λ_j · A[i][j]
+        // where A[i][j] = n_i · M⁻¹ · n_j + (r_i × n_i) · I⁻¹ · (r_j × n_j).
+        // We want v + Δv · n ≥ 0, with λ ≥ 0 and complementary slackness
+        // (a wheel with λ_i > 0 is active; its constraint is exactly met).
+        //
+        // Active-set: start with every bottomed+inward-moving wheel, solve
+        // A·λ = b, drop any wheel where λ_i < 0 (it would have to pull the
+        // chassis down), resolve. With N ≤ ~8 wheels this is a handful of
+        // tiny dense solves.
+        {
+            #[derive(Clone, Copy)]
+            struct BottomedWheel {
+                contact: Point<Real>,
+                normal: Vector<Real>,
+                rel_vel: Real,
             }
+
+            let mut candidates: Vec<BottomedWheel> = self
+                .wheels
+                .iter()
+                .filter(|w| w.shape_cast_info.bottomed_out)
+                .filter_map(|w| {
+                    let normal = w.shape_cast_info.contact_normal_ws;
+                    let contact = w.shape_cast_info.contact_point_ws;
+                    let vel = chassis.velocity_at_point(&contact);
+                    let rel_vel = normal.dot(&vel);
+                    (rel_vel < 0.0).then_some(BottomedWheel {
+                        contact,
+                        normal,
+                        rel_vel,
+                    })
+                })
+                .collect();
+
+            if !candidates.is_empty() {
+                let com = chassis.center_of_mass();
+                let inv_mass = chassis.mprops.local_mprops.inv_mass;
+                let inv_inertia = chassis.mprops.effective_world_inv_inertia;
+
+                loop {
+                    let n = candidates.len();
+                    let mut a = DMatrix::<Real>::zeros(n, n);
+                    let mut b = DVector::<Real>::zeros(n);
+
+                    for i in 0..n {
+                        let w_i = &candidates[i];
+                        let r_i = w_i.contact - com;
+                        let rxn_i = r_i.gcross(w_i.normal);
+                        let i_rxn_i = inv_inertia * rxn_i;
+                        b[i] = -w_i.rel_vel;
+
+                        for j in 0..n {
+                            let w_j = &candidates[j];
+                            let r_j = w_j.contact - com;
+                            let rxn_j = r_j.gcross(w_j.normal);
+                            let lin = inv_mass * w_i.normal.dot(&w_j.normal);
+                            let ang = i_rxn_i.gdot(rxn_j);
+                            a[(i, j)] = lin + ang;
+                        }
+                    }
+
+                    let lambda = match a.clone().lu().solve(&b) {
+                        Some(l) => l,
+                        // Singular (e.g. duplicate contacts). Fall back to
+                        // per-wheel PGS iteration so we still do something
+                        // sensible.
+                        None => {
+                            for w in &candidates {
+                                let denom = a[(0, 0)].max(1.0e-6);
+                                let lambda_i = (-w.rel_vel) / denom;
+                                if lambda_i > 0.0 {
+                                    chassis.apply_impulse_at_point(
+                                        w.normal * lambda_i,
+                                        w.contact,
+                                        false,
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    };
+
+                    // Active-set: if any λ_i < 0, the constraint set is
+                    // infeasible as-is. Drop the most-negative wheel and
+                    // resolve. The dropped wheel's inward velocity is
+                    // satisfied "for free" by the other wheels' impulses.
+                    let mut worst = None;
+                    for i in 0..n {
+                        if lambda[i] < 0.0 {
+                            match worst {
+                                Some((_, worst_val)) if lambda[i] >= worst_val => {}
+                                _ => worst = Some((i, lambda[i])),
+                            }
+                        }
+                    }
+                    if let Some((i, _)) = worst {
+                        candidates.remove(i);
+                        if candidates.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    for i in 0..n {
+                        let w = &candidates[i];
+                        chassis.apply_impulse_at_point(w.normal * lambda[i], w.contact, false);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Bump-stop position correction — aggregated across all bottomed
+        // wheels (PhysX Vehicle SDK pattern): one correction on the chassis
+        // actor per step, resolving the worst overshoot in a single step
+        // (β = 1.0 / hard-constraint behaviour). Aggregating to one
+        // correction is what makes β = 1.0 safe; per-wheel correction at
+        // that factor stacks additively and launches the chassis.
+        //
+        // Chassis rotation is driven by the per-wheel velocity impulses
+        // above — each `apply_impulse_at_point` naturally distributes
+        // into linear + angular response, so uneven bottom-outs on one
+        // side of the vehicle pitch/roll the chassis correctly over the
+        // next few steps. This single-correction position teleport only
+        // handles the linear component.
+        let mut deepest_overshoot = 0.0;
+        let mut correction_normal = Vector::zeros();
+        for wheel in &self.wheels {
+            if wheel.shape_cast_info.bottomed_out
+                && wheel.shape_cast_info.bottom_out_overshoot > deepest_overshoot
+            {
+                deepest_overshoot = wheel.shape_cast_info.bottom_out_overshoot;
+                correction_normal = wheel.shape_cast_info.contact_normal_ws;
+            }
+        }
+        if deepest_overshoot > 0.0 {
+            let correction = correction_normal * deepest_overshoot;
+            let new_pos = Isometry::from_parts(
+                Translation::from(chassis.position().translation.vector + correction),
+                chassis.position().rotation,
+            );
+            chassis.set_position(new_pos, true);
         }
 
         self.update_friction(queries.bodies, queries.colliders, dt);
