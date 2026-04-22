@@ -250,6 +250,15 @@ pub struct ShapeCastInfo {
     pub is_in_contact: bool,
     /// The collider hit by the shape-cast.
     pub ground_object: Option<ColliderHandle>,
+    /// True when the shape-cast would have placed the wheel past the hard
+    /// point (suspension fully compressed). The spring is effectively a
+    /// rigid stop; callers should apply a plastic contact impulse instead
+    /// of relying on the spring alone.
+    pub bottomed_out: bool,
+    /// Signed overshoot in world units along the suspension direction when
+    /// `bottomed_out` is true — how far the chassis is penetrating past the
+    /// hard-point contact. Used for position correction; zero otherwise.
+    pub bottom_out_overshoot: Real,
     /// Debug: raw TOI returned by the last shape-cast hit.
     pub last_toi: Real,
     /// Debug: starting-position offset (along `-direction`) used for the last shape-cast.
@@ -410,20 +419,23 @@ impl DynamicShapeCastVehicleController {
             wheel.shape_cast_info.is_in_contact = true;
             wheel.shape_cast_info.ground_object = Some(collider_hit);
 
-            wheel.shape_cast_info.suspension_length = hit.time_of_impact - offset;
+            let raw_length = hit.time_of_impact - offset;
             wheel.shape_cast_info.last_toi = hit.time_of_impact;
             wheel.shape_cast_info.last_cast_offset = offset;
             wheel.shape_cast_info.last_witness2 = hit.witness2;
             wheel.shape_cast_info.last_cast_start = Point::from(source.coords - direction * offset);
             wheel.shape_cast_info.last_axle_ws = axle;
 
-            // clamp on max suspension travel
-            let min_suspension_length = wheel.suspension_rest_length - wheel.max_suspension_travel;
+            // The wheel can't travel past the hard point — the spring has
+            // a mechanical end stop. A negative `raw_length` means the
+            // cast would have put the wheel above the hard point: the
+            // chassis is overshooting into the ground and the remaining
+            // compression distance has to be absorbed rigidly, not by
+            // spring force.
             let max_suspension_length = wheel.suspension_rest_length + wheel.max_suspension_travel;
-            wheel.shape_cast_info.suspension_length = wheel
-                .shape_cast_info
-                .suspension_length
-                .clamp(min_suspension_length, max_suspension_length);
+            wheel.shape_cast_info.bottomed_out = raw_length < 0.0;
+            wheel.shape_cast_info.bottom_out_overshoot = (-raw_length).max(0.0);
+            wheel.shape_cast_info.suspension_length = raw_length.clamp(0.0, max_suspension_length);
             wheel.shape_cast_info.contact_point_ws = hit.witness1;
 
             let denominator = wheel
@@ -448,6 +460,8 @@ impl DynamicShapeCastVehicleController {
         } else {
             // No contact, put wheel info as in rest position
             wheel.shape_cast_info.suspension_length = wheel.suspension_rest_length;
+            wheel.shape_cast_info.bottomed_out = false;
+            wheel.shape_cast_info.bottom_out_overshoot = 0.0;
             wheel.suspension_relative_velocity = 0.0;
             wheel.shape_cast_info.contact_normal_ws = -wheel.wheel_direction_ws;
             wheel.clipped_inv_contact_dot_suspension = 1.0;
@@ -502,6 +516,38 @@ impl DynamicShapeCastVehicleController {
 
             let impulse = wheel.shape_cast_info.contact_normal_ws * suspension_force * dt;
             chassis.apply_impulse_at_point(impulse, wheel.shape_cast_info.contact_point_ws, false);
+
+            // Bump stop. When the suspension is fully compressed the spring
+            // is physically at its end of travel; further compression can't
+            // be absorbed by force alone. Cancel the chassis velocity into
+            // the ground at the contact (plastic collision) and shift the
+            // chassis back by the overshoot so the wheel visibly sits at
+            // the hard point instead of below it.
+            if wheel.shape_cast_info.bottomed_out {
+                let normal = wheel.shape_cast_info.contact_normal_ws;
+                let contact = wheel.shape_cast_info.contact_point_ws;
+                let vel = chassis.velocity_at_point(&contact);
+                let rel_vel = normal.dot(&vel);
+                if rel_vel < 0.0 {
+                    let dpt = contact - chassis.center_of_mass();
+                    let aj = dpt.gcross(normal);
+                    let iaj = chassis.mprops.effective_world_inv_inertia * aj;
+                    let jac = chassis.mprops.local_mprops.inv_mass + iaj.gdot(iaj);
+                    let inv_jac = crate::utils::inv(jac);
+                    let impulse_mag = -rel_vel * inv_jac;
+                    chassis.apply_impulse_at_point(normal * impulse_mag, contact, false);
+                }
+
+                // Position correction: translate the chassis up by the
+                // overshoot so we don't accumulate penetration. Use a
+                // Baumgarte-style 0.8 factor to keep it stable.
+                let correction = normal * (wheel.shape_cast_info.bottom_out_overshoot * 0.8);
+                let new_pos = Isometry::from_parts(
+                    Translation::from(chassis.position().translation.vector + correction),
+                    chassis.position().rotation,
+                );
+                chassis.set_position(new_pos, true);
+            }
         }
 
         self.update_friction(queries.bodies, queries.colliders, dt);
