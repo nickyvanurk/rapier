@@ -155,6 +155,11 @@ pub struct Wheel {
     pub rotation: Real,
     delta_rotation: Real,
     roll_influence: Real, // TODO: make this public?
+    /// Anti-squat factor in `[0, 1]`: vertical fraction from contact point to
+    /// chassis center-of-mass at which longitudinal (engine/brake) impulse
+    /// is applied. `0` = applied at contact (Bullet default, full pitch
+    /// moment). `1` = applied at COM height (zero pitch moment).
+    pub anti_squat: Real,
     /// The maximum force applied by the suspension.
     pub max_suspension_force: Real,
 
@@ -201,6 +206,7 @@ impl Wheel {
             delta_rotation: 0.0,
             brake: 0.0,
             roll_influence: 0.1,
+            anti_squat: 0.5,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
             wheel_suspension_force: 0.0,
@@ -239,8 +245,15 @@ impl Wheel {
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub struct ShapeCastInfo {
-    /// The (world-space) contact normal between the wheel and the floor.
+    /// World-space suspension-force normal. Locked to the suspension axis
+    /// (`-wheel_direction_ws`) so the spring can't push the chassis sideways
+    /// when a wheel clips a vertical face.
     pub contact_normal_ws: Vector<Real>,
+    /// World-space ground-surface normal from the shape-cast hit. Used to
+    /// build `forward_ws`/`axle_ws` so drive/brake friction stays in the
+    /// real contact plane (otherwise a pitched chassis gains a vertical
+    /// component in its drive force and lifts off under throttle).
+    pub ground_normal_ws: Vector<Real>,
     /// The (world-space) point hit by the wheel’s shape-cast.
     pub contact_point_ws: Point<Real>,
     /// The suspension length for the wheel.
@@ -400,14 +413,17 @@ impl DynamicShapeCastVehicleController {
         wheel.shape_cast_info.ground_object = None;
 
         if let Some((collider_hit, hit)) = hit {
-            // Lock the contact normal to the suspension axis. Using
-            // `hit.normal1` lets a wheel clipping a vertical face (wall,
-            // curb, side of a log) apply the suspension force sideways and
-            // launch the chassis. Trading a bit of slope-accuracy for a
-            // cleanly-axial spring.
-            let normal = -wheel.wheel_direction_ws;
+            // Two separate normals. Suspension uses the axial lock (spring
+            // can't push sideways). Friction uses the real ground normal so
+            // drive force stays in the ground plane. Fall back to axial when
+            // the raw hit is > ~60° off axis (wheel wedged against a wall
+            // isn't drivable ground).
+            let axial = -wheel.wheel_direction_ws;
+            let raw = hit.normal1.into_inner();
+            let ground_normal = if raw.dot(&axial) > 0.5 { raw } else { axial };
 
-            wheel.shape_cast_info.contact_normal_ws = normal;
+            wheel.shape_cast_info.contact_normal_ws = axial;
+            wheel.shape_cast_info.ground_normal_ws = ground_normal;
             wheel.shape_cast_info.is_in_contact = true;
             wheel.shape_cast_info.ground_object = Some(collider_hit);
 
@@ -428,21 +444,7 @@ impl DynamicShapeCastVehicleController {
             let target_length = raw_length.clamp(0.0, max_suspension_length);
             wheel.shape_cast_info.bottomed_out = raw_length < 0.0;
             wheel.shape_cast_info.bottom_out_overshoot = (-raw_length).max(0.0);
-
-            // Smooth the extending direction only (wheel stretching down to
-            // meet ground that just came into view). Compression stays
-            // instant — the chassis needs to feel bumps on the same frame,
-            // and a fast-falling chassis must not visibly sink through the
-            // ground while the spring ramps up.
-            let prev_length = wheel.shape_cast_info.suspension_length;
-            if target_length > prev_length {
-                let time_constant = 0.05;
-                let factor = 1.0 - (-dt / time_constant).exp();
-                wheel.shape_cast_info.suspension_length =
-                    prev_length + (target_length - prev_length) * factor;
-            } else {
-                wheel.shape_cast_info.suspension_length = target_length;
-            }
+            wheel.shape_cast_info.suspension_length = target_length;
             wheel.shape_cast_info.contact_point_ws = hit.witness1;
 
             let denominator = wheel
@@ -480,6 +482,7 @@ impl DynamicShapeCastVehicleController {
             wheel.shape_cast_info.bottom_out_overshoot = 0.0;
             wheel.suspension_relative_velocity = 0.0;
             wheel.shape_cast_info.contact_normal_ws = -wheel.wheel_direction_ws;
+            wheel.shape_cast_info.ground_normal_ws = -wheel.wheel_direction_ws;
             wheel.clipped_inv_contact_dot_suspension = 1.0;
         }
     }
@@ -794,7 +797,10 @@ impl DynamicShapeCastVehicleController {
                 if ground_object.is_some() {
                     self.axle[i] = wheel.wheel_axle_ws;
 
-                    let surf_normal_ws = wheel.shape_cast_info.contact_normal_ws;
+                    // Use the ground normal (actual surface), not the
+                    // suspension-axial normal — otherwise forward_ws tilts
+                    // with the chassis and drive force lifts the vehicle.
+                    let surf_normal_ws = wheel.shape_cast_info.ground_normal_ws;
                     let proj = self.axle[i].dot(&surf_normal_ws);
                     self.axle[i] -= surf_normal_ws * proj;
                     self.axle[i] = self.axle[i]
@@ -910,25 +916,32 @@ impl DynamicShapeCastVehicleController {
 
             for wheel_id in 0..num_wheels {
                 let wheel = &self.wheels[wheel_id];
-                let mut impulse_point = wheel.shape_cast_info.contact_point_ws;
+                let contact_point = wheel.shape_cast_info.contact_point_ws;
+
+                // Anti-squat / anti-roll shifts: both slide the impulse
+                // application point UP along the chassis-up axis toward COM
+                // height, killing the pitch/roll moment generated by forces
+                // applied at the bottom of the wheel.
+                let chassis_up =
+                    chassis.position().rotation * Vector::ith(self.index_up_axis, 1.0);
+                let to_contact_up = chassis_up.dot(&(contact_point - chassis.center_of_mass()));
 
                 if wheel.forward_impulse != 0.0 {
+                    // `anti_squat ∈ [0,1]`: 0 = at contact (Bullet), 1 = at COM height.
+                    let forward_point = contact_point - chassis_up * (to_contact_up * wheel.anti_squat);
                     chassis.apply_impulse_at_point(
                         self.forward_ws[wheel_id] * wheel.forward_impulse,
-                        impulse_point,
+                        forward_point,
                         false,
                     );
                 }
                 if wheel.side_impulse != 0.0 {
                     let side_impulse = self.axle[wheel_id] * wheel.side_impulse;
 
-                    let v_chassis_world_up =
-                        chassis.position().rotation * Vector::ith(self.index_up_axis, 1.0);
-                    impulse_point -= v_chassis_world_up
-                        * (v_chassis_world_up.dot(&(impulse_point - chassis.center_of_mass()))
-                            * (1.0 - wheel.roll_influence));
+                    let side_point =
+                        contact_point - chassis_up * (to_contact_up * (1.0 - wheel.roll_influence));
 
-                    chassis.apply_impulse_at_point(side_impulse, impulse_point, false);
+                    chassis.apply_impulse_at_point(side_impulse, side_point, false);
 
                     // TODO: apply friction impulse on the ground
                     // let ground_object = self.wheels[wheel_id].shape_cast_info.ground_object;
