@@ -160,6 +160,16 @@ pub struct Wheel {
     /// is applied. `0` = applied at contact (Bullet default, full pitch
     /// moment). `1` = applied at COM height (zero pitch moment).
     pub anti_squat: Real,
+    /// Reject a shape-cast hit when the wheel's suspension direction
+    /// points more than this angle away from world-down. In radians,
+    /// default 5π/12 (75°). Rejects hits when the chassis is sideways,
+    /// on its nose/tail, or fully inverted — in those poses the cast
+    /// would otherwise find ground the wrong way round and the spring
+    /// would push the chassis deeper into terrain. The hit normal is
+    /// not a useful signal here: parry returns the static shape's
+    /// outward normal (world-up for a heightfield) regardless of which
+    /// side the cast came from.
+    pub suspension_reject_angle: Real,
     /// The maximum force applied by the suspension.
     pub max_suspension_force: Real,
 
@@ -207,6 +217,12 @@ impl Wheel {
             brake: 0.0,
             roll_influence: 0.1,
             anti_squat: 0.5,
+            // 5π/12 = 75°. Accepts chassis tilt up to 75° from upright
+            // (30° margin above a typical 45° drivable-slope ceiling),
+            // rejects sideways, nose/tail-standing, and inverted poses.
+            // A tighter π/2 boundary is floating-point sensitive —
+            // near-90° tilts slipped through.
+            suspension_reject_angle: 5.0 * std::f32::consts::PI / 12.0,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
             wheel_suspension_force: 0.0,
@@ -366,6 +382,7 @@ impl DynamicShapeCastVehicleController {
         wheel_id: usize,
         dt: Real,
     ) {
+        let world_up = Vector::ith(self.index_up_axis, 1.0);
         let wheel = &mut self.wheels[wheel_id];
         let source = wheel.shape_cast_info.hard_point_ws;
 
@@ -408,6 +425,21 @@ impl DynamicShapeCastVehicleController {
                 compute_impact_geometry_on_penetration: true,
             };
             queries.cast_shape(&pos, &direction, &cylinder, options)
+        };
+
+        // Reject the hit when the suspension direction no longer points
+        // roughly downward in world space (chassis sideways or inverted).
+        // In those poses the cast can still find terrain the wrong way
+        // around, and the spring would push the chassis INTO the ground
+        // along `-suspension_dir` instead of out of it. We can't use the
+        // hit normal for this test — parry reports the static shape's
+        // outward normal (world-up for a heightfield) regardless of which
+        // side the cast came from.
+        let suspension_downward = -direction.dot(&world_up); // 1 when down, -1 when up
+        let hit = if suspension_downward > wheel.suspension_reject_angle.cos() {
+            hit
+        } else {
+            None
         };
 
         wheel.shape_cast_info.ground_object = None;
