@@ -162,7 +162,7 @@ pub struct Wheel {
     pub anti_squat: Real,
     /// Reject a shape-cast hit when the wheel's suspension direction
     /// points more than this angle away from world-down. In radians,
-    /// default 5π/12 (75°). Rejects hits when the chassis is sideways,
+    /// default 80°. Rejects hits when the chassis is sideways,
     /// on its nose/tail, or fully inverted — in those poses the cast
     /// would otherwise find ground the wrong way round and the spring
     /// would push the chassis deeper into terrain. The hit normal is
@@ -217,12 +217,12 @@ impl Wheel {
             brake: 0.0,
             roll_influence: 0.1,
             anti_squat: 0.5,
-            // 5π/12 = 75°. Accepts chassis tilt up to 75° from upright
-            // (30° margin above a typical 45° drivable-slope ceiling),
+            // 80° from upright. Accepts chassis tilt up to 80° (plenty
+            // of margin above a typical 45° drivable-slope ceiling),
             // rejects sideways, nose/tail-standing, and inverted poses.
             // A tighter π/2 boundary is floating-point sensitive —
             // near-90° tilts slipped through.
-            suspension_reject_angle: 5.0 * std::f32::consts::PI / 12.0,
+            suspension_reject_angle: 80.0 * std::f32::consts::PI / 180.0,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
             wheel_suspension_force: 0.0,
