@@ -170,6 +170,15 @@ pub struct Wheel {
     /// outward normal (world-up for a heightfield) regardless of which
     /// side the cast came from.
     pub suspension_reject_angle: Real,
+    /// Reject a shape-cast hit when the contact-surface normal points
+    /// more than this angle away from the anti-suspension direction.
+    /// In radians, default 80° — same boundary as
+    /// `suspension_reject_angle` so the two filters reject symmetric
+    /// cases. Stops the wheel cylinder from "climbing" walls it clips
+    /// when the chassis is pressed against them: without this the cast
+    /// returns a `toi=0` hit and the bump-stop teleports the chassis
+    /// upward.
+    pub surface_reject_angle: Real,
     /// The maximum force applied by the suspension.
     pub max_suspension_force: Real,
 
@@ -223,6 +232,11 @@ impl Wheel {
             // A tighter π/2 boundary is floating-point sensitive —
             // near-90° tilts slipped through.
             suspension_reject_angle: 80.0 * std::f32::consts::PI / 180.0,
+            // 80° from the wheel's anti-suspension direction — same as
+            // suspension_reject_angle. Accepts slopes up to 80°, rejects
+            // walls (90°) and ceilings the cast cylinder clips when the
+            // chassis is pressed against them.
+            surface_reject_angle: 80.0 * std::f32::consts::PI / 180.0,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
             wheel_suspension_force: 0.0,
@@ -400,18 +414,18 @@ impl DynamicShapeCastVehicleController {
             .try_normalize(1.0e-5)
             .unwrap_or(wheel.wheel_direction_ws);
 
-        // Start the cylinder 4× radius behind the hard_point (opposite to
-        // cast direction) so there is plenty of margin before any chassis
-        // geometry above the wheel — the extra headroom avoids the
-        // "cylinder begins in penetration" edge cases that used to need a
-        // retry-with-larger-offset fallback. Detection range stays the
-        // same because `max_time_of_impact = raylen + offset` grows with
-        // `offset`.
-        // suspension_length = toi − offset, matching the raycast's
-        // hit_distance − radius formula.
+        // Start the cylinder one radius behind the hard_point (opposite
+        // to cast direction) so its near cap sits at the hard_point. The
+        // smallest offset that keeps the cylinder from starting inside
+        // the wheel-at-rest position; minimises overlap with external
+        // geometry above the wheel mount (low ceilings, characters
+        // walking next to the chassis). Detection range stays the same
+        // because `max_time_of_impact = raylen + offset` grows with
+        // `offset`. suspension_length = toi − offset, matching the
+        // raycast's hit_distance − radius formula.
         let r = wheel.radius;
         let raylen = wheel.suspension_rest_length + r;
-        let offset = 4.0 * r;
+        let offset = r;
 
         let hit = {
             let pos = Isometry::from_parts(
@@ -421,26 +435,51 @@ impl DynamicShapeCastVehicleController {
             let options = ShapeCastOptions {
                 max_time_of_impact: raylen + offset,
                 target_distance: 0.0,
-                stop_at_penetration: true,
+                // Skip "starts in penetration" hits when the cast
+                // trajectory exits the penetration. Without this, anything
+                // overlapping the cast cylinder above the wheel mount (low
+                // ceiling, character walking next to the chassis) reports
+                // toi=0 and the bump-stop teleports the chassis upward by
+                // `offset` per tick. Genuine bottom-out (cylinder inside
+                // the ground) still reports because moving down doesn't
+                // exit the ground penetration.
+                stop_at_penetration: false,
                 compute_impact_geometry_on_penetration: true,
             };
             queries.cast_shape(&pos, &direction, &cylinder, options)
         };
 
-        // Reject the hit when the suspension direction no longer points
-        // roughly downward in world space (chassis sideways or inverted).
-        // In those poses the cast can still find terrain the wrong way
-        // around, and the spring would push the chassis INTO the ground
-        // along `-suspension_dir` instead of out of it. We can't use the
-        // hit normal for this test — parry reports the static shape's
-        // outward normal (world-up for a heightfield) regardless of which
-        // side the cast came from.
+        // Reject hits in two complementary ways. Both filters target
+        // the same failure mode (the spring pushing the chassis the
+        // wrong way), but they catch different geometry:
+        //
+        // 1. `suspension_reject_angle` — chassis-pose check. Drops the
+        //    hit when the chassis is sideways/inverted, where parry's
+        //    heightfield convention (always +Y outward) would mislead a
+        //    pure normal-based check.
+        // 2. `surface_reject_angle` — hit-normal check. Drops the hit
+        //    when the contact surface isn't drivable from the wheel
+        //    side. The cast cylinder extends radially around its axle,
+        //    so when the chassis is pressed against a wall the cylinder
+        //    clips it and reports a `toi=0` hit; without this filter
+        //    the bump-stop teleports the chassis up `offset` per tick
+        //    ("climbs" the wall).
         let suspension_downward = -direction.dot(&world_up); // 1 when down, -1 when up
         let hit = if suspension_downward > wheel.suspension_reject_angle.cos() {
             hit
         } else {
             None
         };
+        let hit = hit.filter(|(_, h)| {
+            // Compare against world-up, not the suspension direction.
+            // Drivability is a property of the surface in world space
+            // (a 45° slope is always a 45° slope), independent of how
+            // the chassis is currently oriented. Using suspension
+            // direction would let chassis tilt shift the accept/reject
+            // boundary unpredictably.
+            let world_up_facing = h.normal1.into_inner().dot(&world_up);
+            world_up_facing > wheel.surface_reject_angle.cos()
+        });
 
         wheel.shape_cast_info.ground_object = None;
 
@@ -713,7 +752,27 @@ impl DynamicShapeCastVehicleController {
             }
         }
         if deepest_overshoot > 0.0 {
-            let correction = correction_normal * deepest_overshoot;
+            // Cap the per-tick teleport to the wheel's max suspension travel.
+            // A real chassis-into-terrain bottom-out gets corrected over a
+            // few frames instead of one — visually identical, gentler on
+            // velocity. A spurious bottom-out (cylinder cast clipping a
+            // phantom seam between adjacent static colliders, common with
+            // greedy-meshed voxel walls) only nudges the chassis a few cm
+            // before the next frame re-evaluates and the spurious hit
+            // usually disappears — no cascading energy injection.
+            //
+            // Uses the deepest-bottomed wheel's max_suspension_travel as
+            // the cap. Picked because it's the natural "small but
+            // meaningful" length already configured per-wheel; an
+            // unbounded teleport at 60 Hz can be hundreds of m/s.
+            let cap = self
+                .wheels
+                .iter()
+                .filter(|w| w.shape_cast_info.bottomed_out)
+                .map(|w| w.max_suspension_travel)
+                .fold(0.0_f32, Real::max);
+            let applied = deepest_overshoot.min(cap);
+            let correction = correction_normal * applied;
             let new_pos = Isometry::from_parts(
                 Translation::from(chassis.position().translation.vector + correction),
                 chassis.position().rotation,
