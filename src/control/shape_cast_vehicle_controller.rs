@@ -275,9 +275,13 @@ impl Wheel {
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub struct ShapeCastInfo {
-    /// World-space suspension-force normal. Locked to the suspension axis
-    /// (`-wheel_direction_ws`) so the spring can't push the chassis sideways
-    /// when a wheel clips a vertical face.
+    /// World-space suspension-force normal. Follows the shape-cast ground
+    /// normal (Bullet's original convention), with an oblique fallback to the
+    /// suspension axis (`-wheel_direction_ws`) when a wheel clips a vertical
+    /// face so the spring can't push the chassis sideways. Using the real
+    /// ground normal re-enables the `clipped_inv_contact_dot_suspension`
+    /// slope correction; coincides with `ground_normal_ws` except in the
+    /// no-contact branch.
     pub contact_normal_ws: Vector<Real>,
     /// World-space ground-surface normal from the shape-cast hit. Used to
     /// build `forward_ws`/`axle_ws` so drive/brake friction stays in the
@@ -484,16 +488,18 @@ impl DynamicShapeCastVehicleController {
         wheel.shape_cast_info.ground_object = None;
 
         if let Some((collider_hit, hit)) = hit {
-            // Two separate normals. Suspension uses the axial lock (spring
-            // can't push sideways). Friction uses the real ground normal so
-            // drive force stays in the ground plane. Fall back to axial when
-            // the raw hit is > ~60° off axis (wheel wedged against a wall
-            // isn't drivable ground).
+            // Suspension and friction both use the real ground normal (Bullet's
+            // original convention) so the spring reaction stays aligned with the
+            // actual contact plane on slopes — an axial-locked spring leaves a
+            // lateral residual on uneven terrain (creep/jitter). Fall back to
+            // axial when the raw hit is > ~60° off axis (wheel wedged against a
+            // wall isn't drivable ground) — this guard is what stops the spring
+            // from shoving the chassis sideways off a vertical face.
             let axial = -wheel.wheel_direction_ws;
             let raw = hit.normal1.into_inner();
             let ground_normal = if raw.dot(&axial) > 0.5 { raw } else { axial };
 
-            wheel.shape_cast_info.contact_normal_ws = axial;
+            wheel.shape_cast_info.contact_normal_ws = ground_normal;
             wheel.shape_cast_info.ground_normal_ws = ground_normal;
             wheel.shape_cast_info.is_in_contact = true;
             wheel.shape_cast_info.ground_object = Some(collider_hit);
