@@ -863,6 +863,12 @@ impl DynamicShapeCastVehicleController {
             return;
         }
 
+        // Below this chassis speed (m/s) a wheel with no drive/brake engages
+        // longitudinal static friction (see the rolling-friction branch).
+        // Above it the wheel coasts freely so neutral roll/momentum is kept.
+        const STATIC_FRICTION_MAX_SPEED: Real = 0.5;
+        let vehicle_speed = self.current_vehicle_speed.abs();
+
         self.forward_ws.resize(num_wheels, Default::default());
         self.axle.resize(num_wheels, Default::default());
 
@@ -942,11 +948,22 @@ impl DynamicShapeCastVehicleController {
                     if wheel.engine_force != 0.0 {
                         rolling_friction = wheel.engine_force * dt;
                     } else {
-                        let default_rolling_friction_impulse = 0.0;
+                        // Static friction at rest. With no drive or brake,
+                        // Bullet's raycast model zeroes rolling friction so the
+                        // vehicle coasts — but that leaves a parked wheel a free
+                        // longitudinal roller, so the horizontal component of an
+                        // axial suspension force on a pitched chassis creeps the
+                        // vehicle with nothing to resist it. When the vehicle is
+                        // nearly stopped, hold the wheel up to the tire's
+                        // friction limit (μ·N) so it sticks longitudinally just
+                        // like the lateral axis already does; above the speed
+                        // gate the impulse stays 0 and the wheel coasts.
                         let max_impulse = if wheel.brake != 0.0 {
                             wheel.brake
+                        } else if vehicle_speed < STATIC_FRICTION_MAX_SPEED {
+                            wheel.wheel_suspension_force * dt * wheel.friction_slip
                         } else {
-                            default_rolling_friction_impulse
+                            0.0
                         };
                         let contact_pt = WheelContactPoint::new(
                             &bodies[self.chassis],
