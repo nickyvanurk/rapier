@@ -935,6 +935,20 @@ impl DynamicShapeCastVehicleController {
                     }
 
                     wheel.side_impulse *= wheel.side_friction_stiffness;
+
+                    // Side friction is solved Jacobi-style: every grounded wheel
+                    // computes its impulse against the same pre-impulse velocity,
+                    // then all are applied together. N wheels then over-correct
+                    // the shared lateral/roll DOF by ~N×. The 0.2 resolver
+                    // relaxation alone keeps that stable only up to a net
+                    // per-wheel gain of 1.0 — which side_friction_stiffness=5.0
+                    // (0.2 × 5.0) sits exactly at, so multiple wheels tip it into
+                    // a standing oscillation (the at-rest lateral buzz). Share the
+                    // cancel across wheels, exactly as calc_rolling_friction does
+                    // for longitudinal friction, so the summed impulse stays
+                    // ≈ critical (gain 1) for any wheel count without changing
+                    // circle-limited peak grip.
+                    wheel.side_impulse /= num_wheels_on_ground as Real;
                 }
             }
         }
