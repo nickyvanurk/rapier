@@ -582,6 +582,18 @@ impl DynamicShapeCastVehicleController {
         let num_wheels = self.wheels.len();
         let chassis = &queries.bodies[self.chassis];
 
+        // A sleeping chassis is not simulated, but `apply_impulse_at_point` still
+        // mutates its stored velocity — so a parked vehicle silently wound its
+        // suspension impulses into a velocity that was never integrated away.
+        // Measured on a dropped car: 0 m/s at the moment it slept, +0.80 m/s a
+        // second later, held there indefinitely and released as an upward kick
+        // the instant anything woke it. Nothing here is meaningful for a body
+        // that cannot move, and skipping it also stops a parked vehicle
+        // shape-casting once per wheel per step.
+        if chassis.is_sleeping() {
+            return;
+        }
+
         for i in 0..num_wheels {
             self.update_wheel_transform(chassis, i);
         }
