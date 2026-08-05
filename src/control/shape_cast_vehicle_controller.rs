@@ -194,6 +194,17 @@ pub struct Wheel {
     /// The maximum amount of braking impulse applied to slow down the vehicle.
     pub brake: Real,
 
+    /// World-space point this wheel's contact is stuck to while static
+    /// friction holds, or `None` when the wheel is rolling freely.
+    ///
+    /// Velocity-level friction can only cancel the velocity that exists when
+    /// it runs, so a persistent horizontal force re-accelerates the chassis
+    /// every step and the `v * dt` travelled before the cancel is never
+    /// repaid — the vehicle creeps with its velocity pinned near zero. Real
+    /// static friction holds a contact *point*, so the anchor records where
+    /// the contact stuck and the drift away from it is driven back out.
+    static_friction_anchor: Option<Point<Real>>,
+
     clipped_inv_contact_dot_suspension: Real,
     suspension_relative_velocity: Real,
     /// The force applied by the suspension.
@@ -237,6 +248,7 @@ impl Wheel {
             // walls (90°) and ceilings the cast cylinder clips when the
             // chassis is pressed against them.
             surface_reject_angle: 80.0 * std::f32::consts::PI / 180.0,
+            static_friction_anchor: None,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
             wheel_suspension_force: 0.0,
@@ -591,7 +603,7 @@ impl DynamicShapeCastVehicleController {
         }
 
         let chassis_mass = chassis.mass();
-        self.update_suspension(chassis_mass);
+        self.update_suspension(chassis_mass, dt);
 
         let chassis = queries
             .bodies
@@ -823,7 +835,22 @@ impl DynamicShapeCastVehicleController {
         &mut self.wheels
     }
 
-    fn update_suspension(&mut self, chassis_mass: Real) {
+    fn update_suspension(&mut self, chassis_mass: Real, dt: Real) {
+        // Every grounded wheel damps the SAME chassis, so the body feels the
+        // sum of their dampers, not one. Applied explicitly that overshoots by
+        // roughly the wheel count and the excess flips sign each step: the
+        // vehicle rocks between its left and right wheels forever, unloaded
+        // wheels contributing no damping to bleed it off. Folding the damper
+        // into an implicit update makes it unconditionally stable for any
+        // damping and wheel count, and leaves the steady state untouched — at
+        // rest the scale is ~1, so ride height and feel are unchanged.
+        let contacts = self
+            .wheels
+            .iter()
+            .filter(|w| w.shape_cast_info.is_in_contact)
+            .count()
+            .max(1) as Real;
+
         for w_it in 0..self.wheels.len() {
             let wheels = &mut self.wheels[w_it];
 
@@ -849,7 +876,8 @@ impl DynamicShapeCastVehicleController {
                         } else {
                             wheels.damping_relaxation
                         };
-                        force -= susp_damping * projected_rel_vel;
+                        let implicit = 1.0 / (1.0 + dt * susp_damping * contacts);
+                        force -= susp_damping * projected_rel_vel * implicit;
                     }
                 }
 
@@ -873,6 +901,14 @@ impl DynamicShapeCastVehicleController {
         // longitudinal static friction (see the rolling-friction branch).
         // Above it the wheel coasts freely so neutral roll/momentum is kept.
         const STATIC_FRICTION_MAX_SPEED: Real = 0.5;
+        // Fraction of the anchor drift corrected per step. Full correction (1.0)
+        // fights the rest of the solver and rings; this is the usual Baumgarte
+        // trade — firm enough that drift cannot accumulate, soft enough to stay
+        // quiet at rest.
+        const STATIC_FRICTION_ERP: Real = 0.2;
+        // Furthest a stuck contact may drift before the tire is treated as
+        // having slipped and re-grips at its current position.
+        const MAX_STATIC_FRICTION_SLIP: Real = 0.05;
         let vehicle_speed = self.current_vehicle_speed.abs();
 
         self.forward_ws.resize(num_wheels, Default::default());
@@ -886,6 +922,37 @@ impl DynamicShapeCastVehicleController {
 
             if ground_object.is_some() {
                 num_wheels_on_ground += 1;
+            }
+
+            // Latch (or release) the point this wheel is stuck to. Decided once
+            // here because BOTH friction axes need it: longitudinal and lateral
+            // are the same velocity-only constraint and drift the same way.
+            //
+            // A driven wheel is meant to travel, and a world-space anchor on a
+            // moving body is meaningless, so neither gets one.
+            let can_stick = ground_object.is_some()
+                && wheel.engine_force == 0.0
+                && vehicle_speed < STATIC_FRICTION_MAX_SPEED
+                && ground_object
+                    .and_then(|h| colliders[h].parent())
+                    .map(|h| !bodies[h].is_dynamic())
+                    .unwrap_or(true);
+
+            if can_stick {
+                let contact = wheel.shape_cast_info.contact_point_ws;
+                let anchor = *wheel.static_friction_anchor.get_or_insert(contact);
+
+                // A tire sticks only up to a finite slip distance; past that it
+                // has broken traction and grips somewhere new. Without this the
+                // anchor is a world point the wheel can drift arbitrarily far
+                // from, and the correction stops resisting motion and starts
+                // hauling the vehicle back to where it stood seconds ago —
+                // slow-moving cars get visibly dragged and shoved.
+                if (contact - anchor).norm() > MAX_STATIC_FRICTION_SLIP {
+                    wheel.static_friction_anchor = Some(contact);
+                }
+            } else {
+                wheel.static_friction_anchor = None;
             }
 
             wheel.side_impulse = 0.0;
@@ -914,6 +981,16 @@ impl DynamicShapeCastVehicleController {
                         .try_normalize(1.0e-5)
                         .unwrap_or_else(Vector::zeros);
 
+                    // How far the anchored contact has slid sideways, expressed
+                    // as the velocity needed to undo it this step.
+                    let lateral_bias = match wheel.static_friction_anchor {
+                        Some(anchor) => {
+                            let slid = wheel.shape_cast_info.contact_point_ws - anchor;
+                            slid.dot(&self.axle[i]) * STATIC_FRICTION_ERP / dt
+                        }
+                        None => 0.0,
+                    };
+
                     if let Some(ground_body) = ground_object
                         .and_then(|h| colliders[h].parent())
                         .map(|h| &bodies[h])
@@ -925,16 +1002,18 @@ impl DynamicShapeCastVehicleController {
                             ground_body,
                             &wheel.shape_cast_info.contact_point_ws,
                             &self.axle[i],
+                            0.0,
                         );
                     } else {
                         wheel.side_impulse = resolve_single_unilateral(
                             &bodies[self.chassis],
                             &wheel.shape_cast_info.contact_point_ws,
                             &self.axle[i],
+                            lateral_bias,
                         );
                     }
 
-                    wheel.side_impulse *= wheel.side_friction_stiffness;
+wheel.side_impulse *= wheel.side_friction_stiffness;
 
                     // Side friction is solved Jacobi-style: every grounded wheel
                     // computes its impulse against the same pre-impulse velocity,
@@ -978,13 +1057,35 @@ impl DynamicShapeCastVehicleController {
                         // friction limit (μ·N) so it sticks longitudinally just
                         // like the lateral axis already does; above the speed
                         // gate the impulse stays 0 and the wheel coasts.
-                        let max_impulse = if wheel.brake != 0.0 {
-                            wheel.brake
-                        } else if vehicle_speed < STATIC_FRICTION_MAX_SPEED {
+                        // Braking and static friction are not alternatives. A
+                        // stopped wheel resists with whichever is stronger: the
+                        // brake's grip, or the tire's own μN. Treating them as
+                        // exclusive is what let creep survive — callers park a
+                        // token brake on idle wheels, which always won this
+                        // branch and capped the hold at that token value while
+                        // the far larger static limit went unused.
+                        let sticking = vehicle_speed < STATIC_FRICTION_MAX_SPEED;
+
+                        let static_limit = if sticking {
                             wheel.wheel_suspension_force * dt * wheel.friction_slip
                         } else {
                             0.0
                         };
+                        let max_impulse = wheel.brake.max(static_limit);
+
+                        // Latch the contact where it first stuck, then measure
+                        // how far it has slid along the travel direction since.
+                        // Only static ground gets an anchor: a world-space point
+                        // on a moving body is meaningless, and the creep this
+                        // exists to kill is against terrain.
+                        let bias_velocity = match wheel.static_friction_anchor {
+                            Some(anchor) => {
+                                let slid = wheel.shape_cast_info.contact_point_ws - anchor;
+                                slid.dot(&self.forward_ws[wheel_id]) * STATIC_FRICTION_ERP / dt
+                            }
+                            None => 0.0,
+                        };
+
                         let contact_pt = WheelContactPoint::new(
                             &bodies[self.chassis],
                             ground_object
@@ -995,7 +1096,19 @@ impl DynamicShapeCastVehicleController {
                             max_impulse,
                         );
                         assert!(num_wheels_on_ground > 0);
-                        rolling_friction = contact_pt.calc_rolling_friction(num_wheels_on_ground);
+                        rolling_friction =
+                            contact_pt.calc_rolling_friction(num_wheels_on_ground, bias_velocity);
+
+                        // Saturating the limit means the tire broke traction —
+                        // it is sliding, so the old anchor no longer describes
+                        // where it is stuck. Re-latch here rather than dragging
+                        // a stale point behind a sliding wheel.
+                        if wheel.static_friction_anchor.is_some()
+                            && rolling_friction.abs() >= max_impulse
+                        {
+                            wheel.static_friction_anchor =
+                                Some(wheel.shape_cast_info.contact_point_ws);
+                        }
                     }
                 }
 
@@ -1128,7 +1241,16 @@ impl<'a> WheelContactPoint<'a> {
         }
     }
 
-    pub fn calc_rolling_friction(&self, num_wheels_on_ground: usize) -> Real {
+    /// Impulse that cancels the relative velocity along the friction
+    /// direction, plus `bias_velocity` — the rate at which an anchored
+    /// contact must travel to undo the drift it has already accumulated.
+    /// Without that term this is a pure velocity constraint and position
+    /// error accrues forever (see `Wheel::static_friction_anchor`).
+    pub fn calc_rolling_friction(
+        &self,
+        num_wheels_on_ground: usize,
+        bias_velocity: Real,
+    ) -> Real {
         let contact_pos_world = self.friction_position_world;
         let max_impulse = self.max_impulse;
 
@@ -1140,8 +1262,9 @@ impl<'a> WheelContactPoint<'a> {
         let vel = vel1 - vel2;
         let vrel = self.friction_direction_world.dot(&vel);
 
-        // calculate friction that moves us to zero relative velocity
-        (-vrel * self.jac_diag_ab_inv / (num_wheels_on_ground as Real))
+        // friction that moves us to zero relative velocity AND unwinds the
+        // drift the anchor has recorded
+        (-(vrel + bias_velocity) * self.jac_diag_ab_inv / (num_wheels_on_ground as Real))
             .clamp(-max_impulse, max_impulse)
     }
 }
@@ -1152,6 +1275,7 @@ fn resolve_single_bilateral(
     body2: &RigidBody,
     pt2: &Point<Real>,
     normal: &Vector<Real>,
+    bias_velocity: Real,
 ) -> Real {
     let vel1 = body1.velocity_at_point(pt1);
     let vel2 = body2.velocity_at_point(pt2);
@@ -1174,10 +1298,15 @@ fn resolve_single_bilateral(
 
     //todo: move this into proper structure
     let contact_damping = 0.2;
-    -contact_damping * rel_vel * jac_diag_ab_inv
+    -contact_damping * (rel_vel + bias_velocity) * jac_diag_ab_inv
 }
 
-fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vector<Real>) -> Real {
+fn resolve_single_unilateral(
+    body1: &RigidBody,
+    pt1: &Point<Real>,
+    normal: &Vector<Real>,
+    bias_velocity: Real,
+) -> Real {
     let vel1 = body1.velocity_at_point(pt1);
     let dvel = vel1;
     let dpt1 = pt1 - body1.center_of_mass();
@@ -1192,5 +1321,5 @@ fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vect
 
     //todo: move this into proper structure
     let contact_damping = 0.2;
-    -contact_damping * rel_vel * jac_diag_ab_inv
+    -contact_damping * (rel_vel + bias_velocity) * jac_diag_ab_inv
 }
