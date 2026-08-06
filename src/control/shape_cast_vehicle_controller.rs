@@ -1076,14 +1076,20 @@ wheel.side_impulse *= wheel.side_friction_stiffness;
                         // token brake on idle wheels, which always won this
                         // branch and capped the hold at that token value while
                         // the far larger static limit went unused.
-                        let sticking = vehicle_speed < STATIC_FRICTION_MAX_SPEED;
-
-                        let static_limit = if sticking {
-                            wheel.wheel_suspension_force * dt * wheel.friction_slip
-                        } else {
-                            0.0
-                        };
-                        let max_impulse = wheel.brake.max(static_limit);
+                        // What the wheel can resist with is what the brake holds.
+                        // An undriven, unbraked wheel does not resist along its
+                        // travel direction at all — it just rolls, which is why
+                        // Bullet zeroes rolling friction here and why callers set
+                        // brake to 0 to mean "let this roll". Raising the limit to
+                        // the tire's full static grip instead makes a free wheel
+                        // an immovable anchor: on a thruster-driven craft the
+                        // thrust never reaches `engine_force`, so the wheels met
+                        // it with ~10x the vehicle's weight and it could not move.
+                        //
+                        // Creep does not need a bigger limit; it needs the
+                        // position anchor above, whose demand while parked is a
+                        // tiny fraction of even a token brake.
+                        let max_impulse = wheel.brake;
 
                         // Latch the contact where it first stuck, then measure
                         // how far it has slid along the travel direction since.
@@ -1108,18 +1114,29 @@ wheel.side_impulse *= wheel.side_friction_stiffness;
                             max_impulse,
                         );
                         assert!(num_wheels_on_ground > 0);
-                        rolling_friction =
+                        let demand =
                             contact_pt.calc_rolling_friction(num_wheels_on_ground, bias_velocity);
 
-                        // Saturating the limit means the tire broke traction —
-                        // it is sliding, so the old anchor no longer describes
-                        // where it is stuck. Re-latch here rather than dragging
-                        // a stale point behind a sliding wheel.
-                        if wheel.static_friction_anchor.is_some()
-                            && rolling_friction.abs() >= max_impulse
-                        {
-                            wheel.static_friction_anchor =
-                                Some(wheel.shape_cast_info.contact_point_ws);
+                        // Coulomb: the tire sticks only while what it is asked to
+                        // deliver stays inside the friction circle. Past that it
+                        // BREAKS — it slides, and the only thing still resisting
+                        // is the brake.
+                        //
+                        // Clamping to the limit instead (what this did before)
+                        // makes the wheel a permanent handbrake at full grip: a
+                        // thruster-driven vehicle applies its force to the
+                        // chassis, never to `engine_force`, so the anchor never
+                        // released and the wheels fought the thrust with the full
+                        // static limit. Sliding also restores being able to shove
+                        // a parked vehicle, which full grip had quietly stiffened.
+                        //
+                        // Creep is unaffected: an unforced body's demand is
+                        // thousandths of the limit and never breaks traction.
+                        if demand.abs() <= max_impulse {
+                            rolling_friction = demand;
+                        } else {
+                            rolling_friction = demand.signum() * wheel.brake;
+                            wheel.static_friction_anchor = None;
                         }
                     }
                 }
@@ -1155,6 +1172,15 @@ wheel.side_impulse *= wheel.side_friction_stiffness;
         if sliding {
             for wheel in &mut self.wheels {
                 if wheel.side_impulse != 0.0 && wheel.skid_info < 1.0 {
+                    // The friction circle just told us this tire is past what it
+                    // can hold: it is sliding, so it is no longer stuck to the
+                    // point it latched. Releasing the anchor is what lets the
+                    // lateral axis break traction the way the longitudinal one
+                    // does — without it a craft pushed sideways (a thruster
+                    // whose thrust does not line up with the wheels) is pinned in
+                    // place by a hold that can never yield.
+                    wheel.static_friction_anchor = None;
+
                     wheel.forward_impulse *= wheel.skid_info;
                     wheel.side_impulse *= wheel.skid_info;
                 }
@@ -1274,10 +1300,13 @@ impl<'a> WheelContactPoint<'a> {
         let vel = vel1 - vel2;
         let vrel = self.friction_direction_world.dot(&vel);
 
-        // friction that moves us to zero relative velocity AND unwinds the
-        // drift the anchor has recorded
-        (-(vrel + bias_velocity) * self.jac_diag_ab_inv / (num_wheels_on_ground as Real))
-            .clamp(-max_impulse, max_impulse)
+        // Friction that would move us to zero relative velocity AND unwind the
+        // drift the anchor has recorded. Returned UNCLAMPED: whether the tire
+        // can actually deliver this is the caller's Coulomb test, and a clamped
+        // value cannot be distinguished from one that merely happens to sit at
+        // the limit.
+        let _ = max_impulse;
+        -(vrel + bias_velocity) * self.jac_diag_ab_inv / (num_wheels_on_ground as Real)
     }
 }
 
